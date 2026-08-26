@@ -8397,7 +8397,8 @@ async function player() {
 }
 
 async function makeQuestion(key: number) {
-  const base = deloitteFallbackBank[Math.abs(key) % deloitteFallbackBank.length]
+  const randomIndex = Math.floor(Math.random() * deloitteFallbackBank.length)
+  const base = deloitteFallbackBank[randomIndex]
   const apiKey =
     process.env.GEMINI_API_KEY ||
     process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
