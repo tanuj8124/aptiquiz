@@ -11,6 +11,7 @@ import {
 } from '@/lib/db'
 import { createHash } from 'crypto'
 import { generateText } from 'ai'
+import { createGoogleGenerativeAI } from '@ai-sdk/google'
 
 const COOKIE = 'aptitude_player'
 const SECRET_KEY = process.env.AUTH_SECRET || process.env.DATABASE_URL || 'aptiquiz_session_secret_2026'
@@ -139,11 +140,18 @@ async function player() {
 
 async function makeQuestion(key: number) {
   const base = deloitteFallbackBank[Math.abs(key) % deloitteFallbackBank.length]
-  if (!process.env.AI_GATEWAY_API_KEY && !process.env.OPENAI_API_KEY) return base
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GOOGLE_AI_API_KEY
+
+  if (!apiKey) return base
 
   try {
+    const google = createGoogleGenerativeAI({ apiKey })
+    const modelName = process.env.GEMINI_MODEL || 'gemini-3.6-flash'
     const { text } = await generateText({
-      model: 'openai/gpt-5-mini',
+      model: google(modelName),
       prompt: `You are an expert assessment designer creating aptitude test questions specifically tailored for the Deloitte Campus Placement & National Level Assessment (NLA / Deloitte Placement Rounds).
 
 Generate one original, realistic question for assessment round #${key}.
@@ -168,7 +176,8 @@ Rules:
       temperature: 0.85,
     })
 
-    const parsed = JSON.parse(text)
+    const cleanedText = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+    const parsed = JSON.parse(cleanedText)
     if (
       typeof parsed.question === 'string' &&
       Array.isArray(parsed.options) &&
@@ -177,7 +186,8 @@ Rules:
     ) {
       return parsed
     }
-  } catch {
+  } catch (err) {
+    console.error('[Quiz AI] Error generating question with Google Gemini:', err)
     /* fallback keeps rounds available */
   }
   return base
