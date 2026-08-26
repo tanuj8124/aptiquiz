@@ -8382,19 +8382,54 @@ function sign(value: string) {
   return createHash('sha256').update(value + SECRET_KEY).digest('hex')
 }
 
+/**
+ * Token format: `<id>:<b64username>.<hmac>`
+ * Encoding the username lets us silently re-create the player record
+ * when the in-memory store is wiped (Vercel cold-start / dev HMR).
+ */
+function makeToken(id: string, username: string) {
+  const b64 = Buffer.from(username).toString('base64url')
+  const payload = `${id}:${b64}`
+  return `${payload}.${sign(payload)}`
+}
+
 async function player() {
   try {
     const cookieStore = await cookies()
     const token = cookieStore.get(COOKIE)?.value
     if (!token) return null
-    const [id, sig] = token.split('.')
-    if (!id || sig !== sign(id)) return null
-    const p = await getPlayer(id)
+
+    const dotIdx = token.lastIndexOf('.')
+    if (dotIdx === -1) return null
+    const payload = token.slice(0, dotIdx)
+    const sig = token.slice(dotIdx + 1)
+    if (sig !== sign(payload)) return null
+
+    // Support both old format (id) and new format (id:b64username)
+    const colonIdx = payload.indexOf(':')
+    const id = colonIdx === -1 ? payload : payload.slice(0, colonIdx)
+    const b64username = colonIdx === -1 ? '' : payload.slice(colonIdx + 1)
+
+    let p = await getPlayer(id)
+
+    // Self-heal: if the store was wiped, re-create the player from the token
+    if (!p && b64username) {
+      try {
+        const username = Buffer.from(b64username, 'base64url').toString('utf8')
+        const norm = username.toLowerCase()
+        p = await upsertPlayer(username, norm)
+        // Preserve the original id if possible (memory store increments)
+      } catch {
+        return null
+      }
+    }
+
     return p ? { id: p.id, username: p.username, score: p.score } : null
   } catch {
     return null
   }
 }
+
 
 async function makeQuestion(key: number) {
   const randomIndex = Math.floor(Math.random() * deloitteFallbackBank.length)
@@ -8530,7 +8565,7 @@ export async function POST(req: Request) {
       // (prevents accidental account switch on re-join with same username)
       const existingPlayer = await player()
       if (existingPlayer) {
-        const token = existingPlayer.id + '.' + sign(existingPlayer.id)
+        const token = makeToken(existingPlayer.id, existingPlayer.username)
         const res = NextResponse.json({ ok: true, player: existingPlayer })
         res.cookies.set(COOKIE, token, {
           httpOnly: true,
@@ -8555,7 +8590,7 @@ export async function POST(req: Request) {
       }
 
       const pl = await upsertPlayer(finalClean, norm)
-      const token = pl.id + '.' + sign(pl.id)
+      const token = makeToken(pl.id, pl.username)
       const res = NextResponse.json({ ok: true, player: { id: pl.id, username: pl.username, score: pl.score } })
       res.cookies.set(COOKIE, token, {
         httpOnly: true,
