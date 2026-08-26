@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { cookies } from 'next/headers'
 import {
   getPlayer,
+  getPlayerByNorm,
   upsertPlayer,
   getLeaderboard,
   getRoundByKey,
@@ -9,6 +10,7 @@ import {
   getPlayerAnswer,
   submitAnswer,
 } from '@/lib/db'
+
 import { createHash } from 'crypto'
 import { generateText } from 'ai'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
@@ -8522,8 +8524,36 @@ export async function POST(req: Request) {
       if (clean.length < 2) {
         return NextResponse.json({ error: 'Use at least 2 characters' }, { status: 400 })
       }
-      const norm = clean.toLowerCase()
-      const pl = await upsertPlayer(clean, norm)
+
+      // Check if the current request already has a valid session — if so, re-use it
+      // (prevents accidental account switch on re-join with same username)
+      const existingPlayer = await player()
+      if (existingPlayer) {
+        const token = existingPlayer.id + '.' + sign(existingPlayer.id)
+        const res = NextResponse.json({ ok: true, player: existingPlayer })
+        res.cookies.set(COOKIE, token, {
+          httpOnly: true,
+          sameSite: 'lax',
+          secure: process.env.NODE_ENV === 'production',
+          maxAge: 60 * 60 * 24 * 30,
+          path: '/',
+        })
+        return res
+      }
+
+      // Find a unique normalized username to avoid giving this new user
+      // access to an existing player's account
+      let finalClean = clean
+      let norm = clean.toLowerCase()
+      const existingById = await getPlayerByNorm(norm)
+      if (existingById) {
+        // Username is taken — append a random 4-digit suffix to make it unique
+        const suffix = Math.floor(1000 + Math.random() * 9000)
+        finalClean = (clean.slice(0, 15) + '_' + suffix)
+        norm = finalClean.toLowerCase()
+      }
+
+      const pl = await upsertPlayer(finalClean, norm)
       const token = pl.id + '.' + sign(pl.id)
       const res = NextResponse.json({ ok: true, player: { id: pl.id, username: pl.username, score: pl.score } })
       res.cookies.set(COOKIE, token, {

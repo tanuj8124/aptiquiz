@@ -1,6 +1,7 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+
 import { Clock3, Trophy, Zap, LogOut, LockKeyhole, Loader2, CheckCircle2, XCircle } from 'lucide-react'
 
 interface Player {
@@ -45,11 +46,28 @@ export function QuizApp() {
   const [answering, setAnswering] = useState(false)
   const [left, setLeft] = useState(60)
 
+  const signedOutRetryRef = useRef(0)
+  const dataRef = useRef<QuizData | null>(null)
+
   const load = useCallback(async () => {
     try {
       const res = await fetch('/api/quiz', { cache: 'no-store' })
       if (!res.ok) throw new Error('Failed to fetch data')
       const json: QuizData = await res.json()
+
+      // Guard: if we were previously signed in and the server suddenly returns
+      // signedIn:false, retry up to 2 times (handles HMR in-memory store resets
+      // and transient network blips) before accepting it as a real sign-out.
+      if (!json.signedIn && dataRef.current?.signedIn) {
+        if (signedOutRetryRef.current < 2) {
+          signedOutRetryRef.current += 1
+          setTimeout(load, 800)
+          return
+        }
+      }
+      signedOutRetryRef.current = 0
+
+      dataRef.current = json
       setData(json)
       if (json.round?.answered && json.round.result) {
         setSelected(json.round.result.selected_index)
@@ -57,11 +75,11 @@ export function QuizApp() {
     } catch (err) {
       console.error('Failed to load quiz state:', err)
     }
-  }, [])
+  }, []) // stable — reads data via ref
 
   useEffect(() => {
     load()
-  }, [load])
+  }, []) // run only on mount
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -69,14 +87,15 @@ export function QuizApp() {
       setLeft(remainingSeconds)
 
       const currentKey = Math.floor(Date.now() / 60000)
-      if (data?.round && currentKey !== data.round.round_key) {
+      if (dataRef.current?.round && currentKey !== dataRef.current.round.round_key) {
         setSelected(null)
         load()
       }
     }, 1000)
 
     return () => clearInterval(interval)
-  }, [data, load])
+  }, [load]) // load is stable; dataRef reads are safe inside the interval
+
 
   async function join(e: React.FormEvent) {
     e.preventDefault()

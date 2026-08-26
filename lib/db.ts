@@ -159,6 +159,33 @@ export async function getPlayer(id: string): Promise<PlayerRecord | null> {
   return memoryStore.players.get(String(id)) || null
 }
 
+export async function getPlayerByNorm(norm: string): Promise<PlayerRecord | null> {
+  if (poolInstance && !hasCheckedDb) await ensureTables()
+
+  if (usePostgres && poolInstance) {
+    try {
+      const rows = await db.execute(sql`select id, username, username_normalized, score from quiz_players where username_normalized = ${norm} limit 1`)
+      const row = rows.rows[0] as any
+      if (!row) return null
+      return {
+        id: String(row.id),
+        username: row.username,
+        username_normalized: row.username_normalized,
+        score: Number(row.score) || 0,
+        created_at: new Date(row.created_at || Date.now()),
+        last_seen_at: new Date(row.last_seen_at || Date.now()),
+      }
+    } catch {
+      // Fallback to memory
+    }
+  }
+
+  const existingId = memoryStore.playersByNorm.get(norm)
+  if (!existingId) return null
+  return memoryStore.players.get(existingId) || null
+}
+
+
 export async function upsertPlayer(clean: string, norm: string): Promise<PlayerRecord> {
   if (poolInstance && !hasCheckedDb) await ensureTables()
 
