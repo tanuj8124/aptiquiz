@@ -1,8 +1,9 @@
-import { Pool } from 'pg'
-import { drizzle } from 'drizzle-orm/node-postgres'
-import { sql } from 'drizzle-orm'
+import { MongoClient, ObjectId } from 'mongodb'
 
-// In-memory types
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 export interface PlayerRecord {
   id: string
   username: string
@@ -34,12 +35,56 @@ export interface AnswerRecord {
   created_at: Date
 }
 
-// In-memory state store for zero-config local development and fallbacks
+// ---------------------------------------------------------------------------
+// MongoDB singleton (cached on globalThis for Next.js serverless warm reuse)
+// ---------------------------------------------------------------------------
+
+const MONGODB_URI = process.env.MONGODB_URI || ''
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __aptiquiz_mongo: { client: MongoClient; promise: Promise<MongoClient> } | undefined
+}
+
+async function getMongoClient(): Promise<MongoClient | null> {
+  if (!MONGODB_URI) return null
+
+  if (!global.__aptiquiz_mongo) {
+    const client = new MongoClient(MONGODB_URI, {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 10000,
+    })
+    global.__aptiquiz_mongo = { client, promise: client.connect() }
+  }
+
+  try {
+    await global.__aptiquiz_mongo.promise
+    return global.__aptiquiz_mongo.client
+  } catch {
+    global.__aptiquiz_mongo = undefined
+    return null
+  }
+}
+
+function db(client: MongoClient) {
+  const database = client.db('aptiquiz')
+  return {
+    players: database.collection('players'),
+    rounds: database.collection('rounds'),
+    answers: database.collection('answers'),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// In-memory fallback (used when MONGODB_URI is not set)
+// ---------------------------------------------------------------------------
+
 interface StoreState {
   players: Map<string, PlayerRecord>
-  playersByNorm: Map<string, string> // username_normalized -> id
+  playersByNorm: Map<string, string>
   rounds: Map<number, RoundRecord>
-  answers: Map<string, AnswerRecord> // `${player_id}:${round_id}` -> AnswerRecord
+  answers: Map<string, AnswerRecord>
   nextPlayerId: number
   nextRoundId: number
   nextAnswerId: number
@@ -48,7 +93,7 @@ interface StoreState {
 const globalStore = globalThis as unknown as { __aptiquiz_store?: StoreState }
 
 if (!globalStore.__aptiquiz_store) {
-  const store: StoreState = {
+  globalStore.__aptiquiz_store = {
     players: new Map(),
     playersByNorm: new Map(),
     rounds: new Map(),
@@ -57,166 +102,114 @@ if (!globalStore.__aptiquiz_store) {
     nextRoundId: 1,
     nextAnswerId: 1,
   }
+}
 
-  globalStore.__aptiquiz_store = store
-} else {
-  // Clean up any previously seeded dummy accounts if present
-  const dummyUsernames = ['alex_pro', 'quantummind', 'logicmaster', 'speeddemon']
-  for (const norm of dummyUsernames) {
-    const id = globalStore.__aptiquiz_store.playersByNorm.get(norm)
-    if (id) {
-      globalStore.__aptiquiz_store.players.delete(id)
-      globalStore.__aptiquiz_store.playersByNorm.delete(norm)
-    }
+const mem = globalStore.__aptiquiz_store!
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function docToPlayer(doc: any): PlayerRecord {
+  return {
+    id: String(doc._id),
+    username: doc.username,
+    username_normalized: doc.username_normalized,
+    score: Number(doc.score) || 0,
+    created_at: doc.created_at ? new Date(doc.created_at) : new Date(),
+    last_seen_at: doc.last_seen_at ? new Date(doc.last_seen_at) : new Date(),
   }
 }
 
-const memoryStore = globalStore.__aptiquiz_store
-
-let poolInstance: Pool | null = null
-let hasCheckedDb = false
-let usePostgres = false
-
-if (process.env.DATABASE_URL) {
-  try {
-    poolInstance = new Pool({ connectionString: process.env.DATABASE_URL })
-  } catch (err) {
-    console.warn('[DB] Could not initialize PostgreSQL Pool, using in-memory store:', err)
+function docToRound(doc: any): RoundRecord {
+  return {
+    id: String(doc._id),
+    round_key: Number(doc.round_key),
+    starts_at: new Date(doc.starts_at),
+    ends_at: new Date(doc.ends_at),
+    question: doc.question,
+    options: Array.isArray(doc.options) ? doc.options : JSON.parse(doc.options),
+    correct_index: Number(doc.correct_index),
+    explanation: doc.explanation,
+    category: doc.category,
+    difficulty: doc.difficulty,
   }
 }
 
-export const pool = poolInstance || new Pool()
-export const db = drizzle(pool)
-
-async function ensureTables() {
-  if (hasCheckedDb || !poolInstance) return
-  try {
-    const client = await poolInstance.connect()
-    try {
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS quiz_players (
-          id SERIAL PRIMARY KEY,
-          username VARCHAR(255) NOT NULL,
-          username_normalized VARCHAR(255) UNIQUE NOT NULL,
-          score INT DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS quiz_rounds (
-          id SERIAL PRIMARY KEY,
-          round_key BIGINT UNIQUE NOT NULL,
-          starts_at TIMESTAMP NOT NULL,
-          ends_at TIMESTAMP NOT NULL,
-          question TEXT NOT NULL,
-          options JSONB NOT NULL,
-          correct_index INT NOT NULL,
-          explanation TEXT NOT NULL,
-          category VARCHAR(100) NOT NULL,
-          difficulty VARCHAR(50) NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS quiz_answers (
-          id SERIAL PRIMARY KEY,
-          player_id INT NOT NULL,
-          round_id INT NOT NULL,
-          selected_index INT NOT NULL,
-          is_correct BOOLEAN NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE(player_id, round_id)
-        );
-      `)
-      usePostgres = true
-    } finally {
-      client.release()
-    }
-  } catch (err) {
-    console.warn('[DB] PostgreSQL table verification failed, falling back to memory store:', err)
-    usePostgres = false
-  }
-  hasCheckedDb = true
-}
+// ---------------------------------------------------------------------------
+// getPlayer
+// ---------------------------------------------------------------------------
 
 export async function getPlayer(id: string): Promise<PlayerRecord | null> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
-
-  if (usePostgres && poolInstance) {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      const rows = await db.execute(sql`select id, username, score from quiz_players where id = ${id} limit 1`)
-      const row = rows.rows[0] as any
-      if (!row) return null
-      return {
-        id: String(row.id),
-        username: row.username,
-        username_normalized: row.username_normalized || row.username.toLowerCase(),
-        score: Number(row.score) || 0,
-        created_at: new Date(row.created_at || Date.now()),
-        last_seen_at: new Date(row.last_seen_at || Date.now()),
-      }
-    } catch {
-      // Fallback to memory
+      const { players } = db(client)
+      let doc: any = null
+      // Support both ObjectId and plain string ids
+      try { doc = await players.findOne({ _id: new ObjectId(id) }) } catch {}
+      if (!doc) doc = await players.findOne({ _id: id as any })
+      return doc ? docToPlayer(doc) : null
+    } catch (err) {
+      console.error('[MongoDB] getPlayer error:', err)
     }
   }
-
-  return memoryStore.players.get(String(id)) || null
+  return mem.players.get(id) ?? null
 }
+
+// ---------------------------------------------------------------------------
+// getPlayerByNorm
+// ---------------------------------------------------------------------------
 
 export async function getPlayerByNorm(norm: string): Promise<PlayerRecord | null> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
-
-  if (usePostgres && poolInstance) {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      const rows = await db.execute(sql`select id, username, username_normalized, score from quiz_players where username_normalized = ${norm} limit 1`)
-      const row = rows.rows[0] as any
-      if (!row) return null
-      return {
-        id: String(row.id),
-        username: row.username,
-        username_normalized: row.username_normalized,
-        score: Number(row.score) || 0,
-        created_at: new Date(row.created_at || Date.now()),
-        last_seen_at: new Date(row.last_seen_at || Date.now()),
-      }
-    } catch {
-      // Fallback to memory
+      const { players } = db(client)
+      const doc = await players.findOne({ username_normalized: norm })
+      return doc ? docToPlayer(doc) : null
+    } catch (err) {
+      console.error('[MongoDB] getPlayerByNorm error:', err)
     }
   }
-
-  const existingId = memoryStore.playersByNorm.get(norm)
+  const existingId = mem.playersByNorm.get(norm)
   if (!existingId) return null
-  return memoryStore.players.get(existingId) || null
+  return mem.players.get(existingId) ?? null
 }
 
+// ---------------------------------------------------------------------------
+// upsertPlayer
+// ---------------------------------------------------------------------------
 
 export async function upsertPlayer(clean: string, norm: string): Promise<PlayerRecord> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
-
-  if (usePostgres && poolInstance) {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      const rows = await db.execute(
-        sql`insert into quiz_players (username, username_normalized) values (${clean}, ${norm}) on conflict (username_normalized) do update set last_seen_at=now() returning id, username, score`
+      const { players } = db(client)
+      const now = new Date()
+      const result = await players.findOneAndUpdate(
+        { username_normalized: norm },
+        {
+          $setOnInsert: { username: clean, username_normalized: norm, score: 0, created_at: now },
+          $set: { last_seen_at: now },
+        },
+        { upsert: true, returnDocument: 'after' }
       )
-      const pl = rows.rows[0] as any
-      return {
-        id: String(pl.id),
-        username: pl.username,
-        username_normalized: norm,
-        score: Number(pl.score) || 0,
-        created_at: new Date(),
-        last_seen_at: new Date(),
-      }
-    } catch {
-      // Fallback to memory
+      return docToPlayer(result!)
+    } catch (err) {
+      console.error('[MongoDB] upsertPlayer error:', err)
     }
   }
 
-  const existingId = memoryStore.playersByNorm.get(norm)
-  if (existingId && memoryStore.players.has(existingId)) {
-    const p = memoryStore.players.get(existingId)!
+  // In-memory fallback
+  const existingId = mem.playersByNorm.get(norm)
+  if (existingId && mem.players.has(existingId)) {
+    const p = mem.players.get(existingId)!
     p.last_seen_at = new Date()
-    p.username = clean // update casing if changed
+    p.username = clean
     return p
   }
-
-  const newId = String(memoryStore.nextPlayerId++)
+  const newId = String(mem.nextPlayerId++)
   const newPlayer: PlayerRecord = {
     id: newId,
     username: clean,
@@ -225,57 +218,57 @@ export async function upsertPlayer(clean: string, norm: string): Promise<PlayerR
     created_at: new Date(),
     last_seen_at: new Date(),
   }
-  memoryStore.players.set(newId, newPlayer)
-  memoryStore.playersByNorm.set(norm, newId)
+  mem.players.set(newId, newPlayer)
+  mem.playersByNorm.set(norm, newId)
   return newPlayer
 }
 
-export async function getLeaderboard(): Promise<Array<{ username: string; score: number }>> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
+// ---------------------------------------------------------------------------
+// getLeaderboard
+// ---------------------------------------------------------------------------
 
-  if (usePostgres && poolInstance) {
+export async function getLeaderboard(): Promise<Array<{ username: string; score: number }>> {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      const board = await db.execute(sql`select username, score from quiz_players order by score desc, created_at asc limit 10`)
-      return board.rows as Array<{ username: string; score: number }>
-    } catch {
-      // Fallback to memory
+      const { players } = db(client)
+      const docs = await players
+        .find({}, { projection: { username: 1, score: 1 } })
+        .sort({ score: -1, created_at: 1 })
+        .limit(10)
+        .toArray()
+      return docs.map((d) => ({ username: d.username, score: Number(d.score) || 0 }))
+    } catch (err) {
+      console.error('[MongoDB] getLeaderboard error:', err)
     }
   }
 
-  const list = Array.from(memoryStore.players.values())
+  const list = Array.from(mem.players.values())
   list.sort((a, b) => b.score - a.score || a.created_at.getTime() - b.created_at.getTime())
   return list.slice(0, 10).map((p) => ({ username: p.username, score: p.score }))
 }
 
-export async function getRoundByKey(key: number): Promise<RoundRecord | null> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
+// ---------------------------------------------------------------------------
+// getRoundByKey
+// ---------------------------------------------------------------------------
 
-  if (usePostgres && poolInstance) {
+export async function getRoundByKey(key: number): Promise<RoundRecord | null> {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      const rows = await db.execute(
-        sql`select id, round_key, question, options, correct_index, explanation, category, difficulty, starts_at, ends_at from quiz_rounds where round_key = ${key} limit 1`
-      )
-      const r = rows.rows[0] as any
-      if (!r) return null
-      return {
-        id: String(r.id),
-        round_key: Number(r.round_key),
-        starts_at: new Date(r.starts_at),
-        ends_at: new Date(r.ends_at),
-        question: r.question,
-        options: typeof r.options === 'string' ? JSON.parse(r.options) : r.options,
-        correct_index: Number(r.correct_index),
-        explanation: r.explanation,
-        category: r.category,
-        difficulty: r.difficulty,
-      }
-    } catch {
-      // Fallback to memory
+      const { rounds } = db(client)
+      const doc = await rounds.findOne({ round_key: key })
+      return doc ? docToRound(doc) : null
+    } catch (err) {
+      console.error('[MongoDB] getRoundByKey error:', err)
     }
   }
-
-  return memoryStore.rounds.get(key) || null
+  return mem.rounds.get(key) ?? null
 }
+
+// ---------------------------------------------------------------------------
+// saveRound
+// ---------------------------------------------------------------------------
 
 export async function saveRound(data: {
   round_key: number
@@ -288,56 +281,55 @@ export async function saveRound(data: {
   category: string
   difficulty: string
 }): Promise<RoundRecord> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
-
-  if (usePostgres && poolInstance) {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      await db.execute(
-        sql`insert into quiz_rounds (round_key, starts_at, ends_at, question, options, correct_index, explanation, category, difficulty) values (${data.round_key}, ${data.starts_at}, ${data.ends_at}, ${data.question}, ${JSON.stringify(data.options)}::jsonb, ${data.correct_index}, ${data.explanation}, ${data.category}, ${data.difficulty}) on conflict (round_key) do nothing`
+      const { rounds } = db(client)
+      const result = await rounds.findOneAndUpdate(
+        { round_key: data.round_key },
+        { $setOnInsert: { ...data } },
+        { upsert: true, returnDocument: 'after' }
       )
-      const found = await getRoundByKey(data.round_key)
-      if (found) return found
-    } catch {
-      // Fallback to memory
+      return docToRound(result!)
+    } catch (err) {
+      console.error('[MongoDB] saveRound error:', err)
     }
   }
 
-  if (memoryStore.rounds.has(data.round_key)) {
-    return memoryStore.rounds.get(data.round_key)!
-  }
-
-  const roundRecord: RoundRecord = {
-    id: String(memoryStore.nextRoundId++),
-    ...data,
-  }
-  memoryStore.rounds.set(data.round_key, roundRecord)
+  if (mem.rounds.has(data.round_key)) return mem.rounds.get(data.round_key)!
+  const roundRecord: RoundRecord = { id: String(mem.nextRoundId++), ...data }
+  mem.rounds.set(data.round_key, roundRecord)
   return roundRecord
 }
+
+// ---------------------------------------------------------------------------
+// getPlayerAnswer
+// ---------------------------------------------------------------------------
 
 export async function getPlayerAnswer(
   playerId: string,
   roundId: string
 ): Promise<{ selected_index: number; is_correct: boolean } | null> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
-
-  if (usePostgres && poolInstance) {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      const answer = await db.execute(
-        sql`select selected_index, is_correct from quiz_answers where player_id = ${playerId} and round_id = ${roundId} limit 1`
-      )
-      const a = answer.rows[0] as any
-      if (a) return { selected_index: Number(a.selected_index), is_correct: Boolean(a.is_correct) }
+      const { answers } = db(client)
+      const doc = await answers.findOne({ player_id: playerId, round_id: roundId })
+      if (doc) return { selected_index: Number(doc.selected_index), is_correct: Boolean(doc.is_correct) }
       return null
-    } catch {
-      // Fallback
+    } catch (err) {
+      console.error('[MongoDB] getPlayerAnswer error:', err)
     }
   }
 
   const key = `${playerId}:${roundId}`
-  const a = memoryStore.answers.get(key)
-  if (a) return { selected_index: a.selected_index, is_correct: a.is_correct }
-  return null
+  const a = mem.answers.get(key)
+  return a ? { selected_index: a.selected_index, is_correct: a.is_correct } : null
 }
+
+// ---------------------------------------------------------------------------
+// submitAnswer
+// ---------------------------------------------------------------------------
 
 export async function submitAnswer(
   playerId: string,
@@ -345,45 +337,61 @@ export async function submitAnswer(
   selectedIndex: number,
   isCorrect: boolean
 ): Promise<boolean> {
-  if (poolInstance && !hasCheckedDb) await ensureTables()
-
-  if (usePostgres && poolInstance) {
+  const client = await getMongoClient()
+  if (client) {
     try {
-      await db.execute(
-        sql`insert into quiz_answers (player_id, round_id, selected_index, is_correct) values (${playerId}, ${roundId}, ${selectedIndex}, ${isCorrect}) on conflict (player_id, round_id) do nothing`
-      )
+      const { answers, players } = db(client)
+
+      // Insert answer — ignore if already answered (unique index on player_id + round_id)
+      const existing = await answers.findOne({ player_id: playerId, round_id: roundId })
+      if (existing) return false
+
+      await answers.insertOne({
+        player_id: playerId,
+        round_id: roundId,
+        selected_index: selectedIndex,
+        is_correct: isCorrect,
+        created_at: new Date(),
+      })
+
       if (isCorrect) {
-        await db.execute(
-          sql`update quiz_players set score=score+1, last_seen_at=now() where id=${playerId} and not exists (select 1 from quiz_answers where player_id=${playerId} and round_id=${roundId} and id <> (select max(id) from quiz_answers where player_id=${playerId} and round_id=${roundId}))`
-        )
+        // Increment score — try ObjectId first, then string id
+        let updated = false
+        try {
+          const r = await players.updateOne(
+            { _id: new ObjectId(playerId) },
+            { $inc: { score: 1 }, $set: { last_seen_at: new Date() } }
+          )
+          updated = r.modifiedCount > 0
+        } catch {}
+        if (!updated) {
+          await players.updateOne(
+            { _id: playerId as any },
+            { $inc: { score: 1 }, $set: { last_seen_at: new Date() } }
+          )
+        }
       }
+
       return true
-    } catch {
-      // Fallback
+    } catch (err) {
+      console.error('[MongoDB] submitAnswer error:', err)
     }
   }
 
+  // In-memory fallback
   const key = `${playerId}:${roundId}`
-  if (memoryStore.answers.has(key)) {
-    return false // Already answered
-  }
-
-  memoryStore.answers.set(key, {
-    id: String(memoryStore.nextAnswerId++),
+  if (mem.answers.has(key)) return false
+  mem.answers.set(key, {
+    id: String(mem.nextAnswerId++),
     player_id: playerId,
     round_id: roundId,
     selected_index: selectedIndex,
     is_correct: isCorrect,
     created_at: new Date(),
   })
-
   if (isCorrect) {
-    const player = memoryStore.players.get(String(playerId))
-    if (player) {
-      player.score += 1
-      player.last_seen_at = new Date()
-    }
+    const player = mem.players.get(String(playerId))
+    if (player) { player.score += 1; player.last_seen_at = new Date() }
   }
-
   return true
 }
