@@ -119,7 +119,6 @@ export function QuizApp() {
         const data = JSON.parse(e.data)
         if (data.player) setPlayer(data.player)
         if (data.leaderboard) setLeaderboard(data.leaderboard)
-        setStatus("playing")
 
         // Sync if already answered on server for this round
         if (data.round?.answered && data.round?.result && data.round.round_key === roundKeyRef.current) {
@@ -143,25 +142,33 @@ export function QuizApp() {
     })
 
     es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) {
-        // Check if we have an active session via API or need login
-        fetch("/api/quiz")
-          .then((res) => res.json())
-          .then((data) => {
-            if (data.signedIn && data.player) {
-              setPlayer(data.player)
-              setStatus("playing")
-            } else {
-              setStatus("unauthenticated")
-            }
-          })
-          .catch(() => setStatus("unauthenticated"))
-      }
+      // If disconnected, don't block gameplay
     }
   }, [])
 
+  // ---------------------------------------------------------------------------
+  // Fast Initial Auth Check (Instantaneous, avoids SSE 401 timeout)
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    connectSSE()
+    // Check saved username preference if any
+    const savedName = localStorage.getItem("aptiquiz_name")
+    if (savedName) setName(savedName)
+
+    fetch("/api/quiz", { cache: "no-store" })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.signedIn && data.player) {
+          setPlayer(data.player)
+          setStatus("playing")
+          connectSSE()
+        } else {
+          setStatus("unauthenticated")
+        }
+      })
+      .catch(() => {
+        setStatus("unauthenticated")
+      })
+
     return () => {
       esRef.current?.close()
       esRef.current = null
@@ -181,6 +188,7 @@ export function QuizApp() {
     setErrorMsg("")
     setBusy(true)
     try {
+      localStorage.setItem("aptiquiz_name", clean)
       const res = await fetch("/api/quiz", {
         method: "POST",
         headers: { "content-type": "application/json" },
