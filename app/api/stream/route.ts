@@ -34,12 +34,7 @@ async function getPlayerFromCookies() {
     if (token.slice(dotIdx + 1) !== sign(payload)) return null
     const colonIdx = payload.indexOf(':')
     const id = colonIdx === -1 ? payload : payload.slice(0, colonIdx)
-    const b64username = colonIdx === -1 ? '' : payload.slice(colonIdx + 1)
-    let p = await getPlayer(id)
-    if (!p && b64username) {
-      const username = Buffer.from(b64username, 'base64url').toString('utf8')
-      p = await upsertPlayer(username, username.toLowerCase())
-    }
+    const p = await getPlayer(id)
     return p ? { id: p.id, username: p.username, score: p.score } : null
   } catch { return null }
 }
