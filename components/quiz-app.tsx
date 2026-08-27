@@ -1,20 +1,21 @@
-'use client'
+﻿"use client"
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from "react"
+import { Clock3, Trophy, Zap, LogOut, LockKeyhole, Loader2, CheckCircle2, XCircle } from "lucide-react"
+import { deloitteFallbackBank } from "@/app/api/quiz/question-bank"
 
-import { Clock3, Trophy, Zap, LogOut, LockKeyhole, Loader2, CheckCircle2, XCircle } from 'lucide-react'
+// ---------------------------------------------------------------------------
+// Types & Helpers
+// ---------------------------------------------------------------------------
 
-interface Player {
-  id: string
-  username: string
-  score: number
-}
+interface Player { id: string; username: string; score: number }
 
 interface Round {
-  id: string
+  id?: string
   round_key: number
   question: string
   options: string[]
+  correct_index: number
   explanation?: string
   category: string
   difficulty: string
@@ -24,150 +25,245 @@ interface Round {
   result: { selected_index: number; is_correct: boolean } | null
 }
 
-interface LeaderboardEntry {
-  username: string
-  score: number
+interface LeaderboardEntry { username: string; score: number }
+
+function getRoundKey() {
+  return Math.floor(Date.now() / 60000)
 }
 
-interface QuizData {
-  signedIn: boolean
-  player?: Player
-  round?: Round
-  leaderboard?: LeaderboardEntry[]
-  now?: number
+function getSecondsLeft() {
+  const secs = Math.floor(Date.now() / 1000) % 60
+  return secs === 0 ? 0 : 60 - secs
 }
+
+function getLocalRound(key: number): Round {
+  const q = deloitteFallbackBank[key % deloitteFallbackBank.length]
+  const starts = new Date(key * 60000).toISOString()
+  const ends = new Date((key + 1) * 60000).toISOString()
+  return {
+    round_key: key,
+    question: q.question,
+    options: q.options,
+    correct_index: q.correct,
+    explanation: q.explanation || "",
+    category: q.category || "Deloitte Quants",
+    difficulty: q.difficulty || "Medium",
+    starts_at: starts,
+    ends_at: ends,
+    answered: false,
+    result: null,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 
 export function QuizApp() {
-  const [data, setData] = useState<QuizData | null>(null)
-  const [name, setName] = useState('')
-  const [errorMsg, setErrorMsg] = useState('')
-  const [selected, setSelected] = useState<number | null>(null)
+  const [status, setStatus] = useState<"connecting" | "unauthenticated" | "playing">("connecting")
+  const [name, setName] = useState("")
+  const [errorMsg, setErrorMsg] = useState("")
   const [busy, setBusy] = useState(false)
-  const [answering, setAnswering] = useState(false)
-  const [left, setLeft] = useState(60)
 
-  const signedOutRetryRef = useRef(0)
-  const dataRef = useRef<QuizData | null>(null)
+  const [player, setPlayer] = useState<Player | null>(null)
+  const [roundKey, setRoundKey] = useState<number>(getRoundKey)
+  const [round, setRound] = useState<Round>(() => getLocalRound(getRoundKey()))
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([])
+  const [secondsLeft, setSecondsLeft] = useState<number>(getSecondsLeft)
 
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch('/api/quiz', { cache: 'no-store' })
-      if (!res.ok) throw new Error('Failed to fetch data')
-      const json: QuizData = await res.json()
+  // Local answer selection & feedback
+  const [selected, setSelected] = useState<number | null>(null)
+  const [localResult, setLocalResult] = useState<{ selected_index: number; is_correct: boolean } | null>(null)
+  const answerLockRef = useRef(false)
 
-      // Guard: if we were previously signed in and the server suddenly returns
-      // signedIn:false, retry up to 2 times (handles HMR in-memory store resets
-      // and transient network blips) before accepting it as a real sign-out.
-      if (!json.signedIn && dataRef.current?.signedIn) {
-        if (signedOutRetryRef.current < 2) {
-          signedOutRetryRef.current += 1
-          setTimeout(load, 800)
-          return
-        }
-      }
-      signedOutRetryRef.current = 0
+  const esRef = useRef<EventSource | null>(null)
+  const roundKeyRef = useRef<number>(getRoundKey())
 
-      dataRef.current = json
-      setData(json)
-      if (json.round?.answered && json.round.result) {
-        setSelected(json.round.result.selected_index)
-      }
-    } catch (err) {
-      console.error('Failed to load quiz state:', err)
-    }
-  }, []) // stable — reads data via ref
-
+  // ---------------------------------------------------------------------------
+  // Instant Client-side Clock & Transition Loop (0ms Latency)
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    load()
-  }, []) // run only on mount
+    const timer = setInterval(() => {
+      const remaining = getSecondsLeft()
+      setSecondsLeft(remaining)
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const remainingSeconds = 60 - Math.floor((Date.now() / 1000) % 60)
-      setLeft(remainingSeconds)
-
-      const currentKey = Math.floor(Date.now() / 60000)
-      if (dataRef.current?.round && currentKey !== dataRef.current.round.round_key) {
+      const currKey = getRoundKey()
+      if (currKey !== roundKeyRef.current) {
+        // Instant 0ms transition right as the second hits 00
+        roundKeyRef.current = currKey
+        setRoundKey(currKey)
+        setRound(getLocalRound(currKey))
         setSelected(null)
-        load()
+        setLocalResult(null)
+        answerLockRef.current = false
       }
-    }, 1000)
+    }, 200)
 
-    return () => clearInterval(interval)
-  }, [load]) // load is stable; dataRef reads are safe inside the interval
+    return () => clearInterval(timer)
+  }, [])
 
+  // ---------------------------------------------------------------------------
+  // Real-time SSE Stream for Live Leaderboard & Player Sync
+  // ---------------------------------------------------------------------------
+  const connectSSE = useCallback(() => {
+    if (esRef.current) {
+      esRef.current.close()
+      esRef.current = null
+    }
 
+    const es = new EventSource("/api/stream")
+    esRef.current = es
+
+    es.addEventListener("init", (e) => {
+      try {
+        const data = JSON.parse(e.data)
+        if (data.player) setPlayer(data.player)
+        if (data.leaderboard) setLeaderboard(data.leaderboard)
+        setStatus("playing")
+
+        // Sync if already answered on server for this round
+        if (data.round?.answered && data.round?.result && data.round.round_key === roundKeyRef.current) {
+          setSelected(data.round.result.selected_index)
+          setLocalResult({
+            selected_index: data.round.result.selected_index,
+            is_correct: data.round.result.is_correct,
+          })
+          answerLockRef.current = true
+        }
+      } catch (err) {
+        console.error("Failed to parse init:", err)
+      }
+    })
+
+    es.addEventListener("leaderboard", (e) => {
+      try {
+        const { entries } = JSON.parse(e.data)
+        if (entries) setLeaderboard(entries)
+      } catch {}
+    })
+
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED) {
+        // Check if we have an active session via API or need login
+        fetch("/api/quiz")
+          .then((res) => res.json())
+          .then((data) => {
+            if (data.signedIn && data.player) {
+              setPlayer(data.player)
+              setStatus("playing")
+            } else {
+              setStatus("unauthenticated")
+            }
+          })
+          .catch(() => setStatus("unauthenticated"))
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    connectSSE()
+    return () => {
+      esRef.current?.close()
+      esRef.current = null
+    }
+  }, [connectSSE])
+
+  // ---------------------------------------------------------------------------
+  // Login
+  // ---------------------------------------------------------------------------
   async function join(e: React.FormEvent) {
     e.preventDefault()
     const clean = name.trim()
     if (clean.length < 2) {
-      setErrorMsg('Please enter at least 2 characters')
+      setErrorMsg("Please enter at least 2 characters")
       return
     }
-    setErrorMsg('')
+    setErrorMsg("")
     setBusy(true)
     try {
-      const res = await fetch('/api/quiz', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
+      const res = await fetch("/api/quiz", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ username: clean }),
       })
       const result = await res.json()
       if (!res.ok) {
-        setErrorMsg(result.error || 'Failed to enter quiz')
+        setErrorMsg(result.error || "Failed to enter quiz")
       } else {
-        await load()
+        if (result.player) setPlayer(result.player)
+        setStatus("playing")
+        connectSSE()
       }
     } catch {
-      setErrorMsg('Network error. Please try again.')
+      setErrorMsg("Network error. Please try again.")
     } finally {
       setBusy(false)
     }
   }
 
-  async function answer(idx: number) {
-    if (!data?.round || selected !== null || data.round.answered || left === 0 || answering) return
+  // ---------------------------------------------------------------------------
+  // Answer — Instant zero-latency verification & background sync
+  // ---------------------------------------------------------------------------
+  function answer(idx: number) {
+    if (answerLockRef.current || !round || secondsLeft === 0) return
+    if (selected !== null || round.answered) return
+    answerLockRef.current = true
+
+    // 100% Instant local checking
+    const isCorrect = idx === round.correct_index
     setSelected(idx)
-    setAnswering(true)
-    try {
-      const res = await fetch('/api/quiz', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ answer: idx }),
-      })
-      if (res.ok) {
-        await load()
-      }
-    } catch (err) {
-      console.error('Failed to submit answer:', err)
-    } finally {
-      setAnswering(false)
+    setLocalResult({ selected_index: idx, is_correct: isCorrect })
+
+    if (isCorrect) {
+      setPlayer((prev) => (prev ? { ...prev, score: prev.score + 1 } : prev))
     }
+
+    // Submit to server in background for persistent DB score and friend leaderboard
+    fetch("/api/quiz", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ answer: idx }),
+    }).catch(() => {
+      // Background sync error - local progress is preserved
+    })
   }
 
+  // ---------------------------------------------------------------------------
+  // Sign Out
+  // ---------------------------------------------------------------------------
   async function signOut() {
     try {
-      await fetch('/api/quiz', { method: 'DELETE' })
-      setData({ signedIn: false })
-      setName('')
+      esRef.current?.close()
+      esRef.current = null
+      await fetch("/api/quiz", { method: "DELETE" })
+      setStatus("unauthenticated")
+      setPlayer(null)
       setSelected(null)
+      setLocalResult(null)
+      answerLockRef.current = false
     } catch (err) {
-      console.error('Sign out error:', err)
+      console.error("Sign out error:", err)
     }
   }
 
-  if (!data) {
+  // ---------------------------------------------------------------------------
+  // Render: Loading
+  // ---------------------------------------------------------------------------
+  if (status === "connecting") {
     return (
       <main className="grid min-h-screen place-items-center bg-background text-muted-foreground">
         <div className="flex items-center gap-3">
           <Loader2 className="size-6 animate-spin text-primary" />
-          <span className="text-base font-medium">Loading challenge…</span>
+          <span className="text-base font-medium">Starting challenges...</span>
         </div>
       </main>
     )
   }
 
-  if (data.signedIn === false) {
+  // ---------------------------------------------------------------------------
+  // Render: Sign-in
+  // ---------------------------------------------------------------------------
+  if (status === "unauthenticated") {
     return (
       <main className="min-h-screen grid place-items-center px-6 bg-gradient-to-b from-background via-background to-muted/20">
         <section className="w-full max-w-md">
@@ -177,29 +273,25 @@ export function QuizApp() {
             </span>
             <span className="font-mono text-sm font-semibold tracking-[.25em]">DELOITTE APTIQUIZ</span>
           </div>
-
           <h1 className="text-5xl md:text-6xl font-bold tracking-tight text-balance">
-            Crack Deloitte.<br />
-            <span className="text-primary">Master Aptitude.</span>
+            Crack Deloitte.<br /><span className="text-primary">Master Aptitude.</span>
           </h1>
-
           <p className="mt-5 text-lg leading-7 text-muted-foreground">
-            Fast-paced questions directly focused on Deloitte Placement Rounds (Quants, Logical Reasoning & Verbal Ability). A new challenge every minute!
+            Fast-paced questions directly focused on Deloitte Placement Rounds. Compete with your friends in real-time!
           </p>
-
           <form onSubmit={join} className="mt-10 flex flex-col gap-3">
             <div className="flex gap-3">
               <input
                 id="username-input"
                 type="text"
                 value={name}
+                autoFocus
+                maxLength={20}
                 onChange={(e) => {
                   setName(e.target.value)
-                  if (errorMsg) setErrorMsg('')
+                  if (errorMsg) setErrorMsg("")
                 }}
-                placeholder="Choose a nickname"
-                maxLength={20}
-                autoFocus
+                placeholder="Enter nickname"
                 className="min-w-0 flex-1 rounded-xl border bg-card px-4 py-3 text-foreground placeholder:text-muted-foreground outline-none ring-primary transition focus:ring-2 focus:border-transparent"
               />
               <button
@@ -208,32 +300,24 @@ export function QuizApp() {
                 disabled={busy}
                 className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-6 py-3 font-semibold text-primary-foreground shadow-md shadow-primary/20 transition hover:brightness-110 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {busy ? <Loader2 size={18} className="animate-spin" /> : 'Enter'}
+                {busy ? <Loader2 size={18} className="animate-spin" /> : "Enter"}
               </button>
             </div>
-            {errorMsg && (
-              <p className="text-sm font-medium text-destructive animate-in fade-in">
-                {errorMsg}
-              </p>
-            )}
+            {errorMsg && <p className="text-sm font-medium text-destructive animate-in fade-in">{errorMsg}</p>}
           </form>
         </section>
       </main>
     )
   }
 
-  const r = data.round
-  if (!r) {
-    return (
-      <main className="grid min-h-screen place-items-center text-muted-foreground">
-        <Loader2 className="size-6 animate-spin text-primary" />
-      </main>
-    )
-  }
+  const effectiveResult = localResult ?? round.result
+  const answered = round.answered || !!localResult
+  const locked = secondsLeft === 0 || answered
+  const isCorrect = effectiveResult?.is_correct
 
-  const locked = left === 0 || r.answered
-  const isCorrect = r.result?.is_correct
-
+  // ---------------------------------------------------------------------------
+  // Render: Quiz Game UI
+  // ---------------------------------------------------------------------------
   return (
     <main className="min-h-screen px-5 py-8 md:px-10 bg-background">
       <header className="mx-auto flex max-w-6xl items-center justify-between">
@@ -246,8 +330,8 @@ export function QuizApp() {
         <div className="flex items-center gap-4 text-sm">
           <div className="flex items-center gap-2 rounded-full border bg-card/60 px-3.5 py-1.5 backdrop-blur-sm">
             <span className="size-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span className="font-medium text-foreground">{data.player?.username}</span>
-            <span className="text-xs text-muted-foreground font-mono">({data.player?.score} pts)</span>
+            <span className="font-medium text-foreground">{player?.username || "Player"}</span>
+            <span className="text-xs text-muted-foreground font-mono">({player?.score ?? 0} pts)</span>
           </div>
           <button
             onClick={signOut}
@@ -261,63 +345,63 @@ export function QuizApp() {
       </header>
 
       <div className="mx-auto mt-12 grid max-w-6xl gap-6 lg:grid-cols-[1fr_320px]">
-        {/* Question Section */}
+        {/* Question Area */}
         <section>
           <div className="mb-6 flex items-center justify-between">
             <div>
               <p className="font-mono text-xs font-semibold uppercase tracking-[.2em] text-primary">
-                {r.category} / {r.difficulty}
+                {round.category} / {round.difficulty}
               </p>
-              <p className="mt-1 text-sm text-muted-foreground">Round #{r.round_key}</p>
+              <p className="mt-1 text-sm text-muted-foreground">Round #{roundKey}</p>
             </div>
             <div
               className={`flex items-center gap-2 rounded-full border px-4 py-2 font-mono text-sm font-semibold transition ${
-                left < 10
-                  ? 'border-destructive bg-destructive/10 text-destructive animate-pulse'
-                  : 'border-primary/30 bg-primary/5 text-primary'
+                secondsLeft < 10
+                  ? "border-destructive bg-destructive/10 text-destructive animate-pulse"
+                  : "border-primary/30 bg-primary/5 text-primary"
               }`}
             >
               <Clock3 size={16} />
-              {String(left).padStart(2, '0')}s
+              {String(secondsLeft).padStart(2, "0")}s
             </div>
           </div>
 
           <article className="rounded-2xl border bg-card p-6 shadow-sm md:p-10">
             <h1 className="max-w-3xl text-2xl md:text-3xl lg:text-4xl font-semibold leading-tight text-balance">
-              {r.question}
+              {round.question}
             </h1>
 
             <div className="mt-8 grid gap-3">
-              {r.options.map((option: string, idx: number) => {
-                const isSelected = selected === idx || r.result?.selected_index === idx
+              {round.options.map((option, idx) => {
+                const isSelected = selected === idx || effectiveResult?.selected_index === idx
                 return (
                   <button
                     key={idx}
-                    disabled={locked || answering}
+                    disabled={locked}
                     onClick={() => answer(idx)}
-                    className={`group flex items-center gap-4 rounded-xl border p-4 text-left transition ${
+                    className={`group flex items-center gap-4 rounded-xl border p-4 text-left transition-all duration-100 ${
                       isSelected
                         ? isCorrect
-                          ? 'border-emerald-500 bg-emerald-500/10 text-emerald-950 dark:text-emerald-200'
-                          : r.answered
-                          ? 'border-rose-500 bg-rose-500/10 text-rose-950 dark:text-rose-200'
-                          : 'border-primary bg-primary/10'
-                        : ''
+                          ? "border-emerald-500 bg-emerald-500/10 text-emerald-950 dark:text-emerald-200"
+                          : answered
+                          ? "border-rose-500 bg-rose-500/10 text-rose-950 dark:text-rose-200"
+                          : "border-primary bg-primary/10"
+                        : ""
                     } ${
                       locked
-                        ? 'cursor-not-allowed opacity-75'
-                        : 'hover:border-primary hover:bg-primary/5 active:scale-[0.99]'
+                        ? "cursor-not-allowed opacity-75"
+                        : "hover:border-primary hover:bg-primary/5 active:scale-[0.99] cursor-pointer"
                     }`}
                   >
                     <span
-                      className={`grid size-8 shrink-0 place-items-center rounded-lg font-mono text-sm font-bold transition ${
+                      className={`grid size-8 shrink-0 place-items-center rounded-lg font-mono text-sm font-bold transition-colors duration-100 ${
                         isSelected
                           ? isCorrect
-                            ? 'bg-emerald-500 text-white'
-                            : r.answered
-                            ? 'bg-rose-500 text-white'
-                            : 'bg-primary text-primary-foreground'
-                          : 'bg-muted text-foreground group-hover:bg-primary group-hover:text-primary-foreground'
+                            ? "bg-emerald-500 text-white"
+                            : answered
+                            ? "bg-rose-500 text-white"
+                            : "bg-primary text-primary-foreground"
+                          : "bg-muted text-foreground group-hover:bg-primary group-hover:text-primary-foreground"
                       }`}
                     >
                       {String.fromCharCode(65 + idx)}
@@ -330,7 +414,7 @@ export function QuizApp() {
 
             {locked && (
               <div className="mt-6 flex items-start gap-3 rounded-xl bg-muted/60 border p-4 text-sm">
-                {r.result ? (
+                {effectiveResult ? (
                   isCorrect ? (
                     <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-500" />
                   ) : (
@@ -341,19 +425,19 @@ export function QuizApp() {
                 )}
                 <div>
                   <p className="font-semibold">
-                    {r.result
+                    {effectiveResult
                       ? isCorrect
-                        ? 'Correct! +1 point added.'
-                        : 'Not quite right this time.'
-                      : 'Round locked.'}
+                        ? "Correct! +1 point added."
+                        : "Not quite right this time."
+                      : "Round locked - time is up!"}
                   </p>
-                  {r.explanation && (
+                  {effectiveResult && round.explanation && (
                     <p className="mt-1 text-muted-foreground text-xs leading-relaxed">
-                      {r.explanation}
+                      {round.explanation}
                     </p>
                   )}
                   <p className="mt-2 text-xs font-mono text-primary">
-                    Next challenge starts when the timer reaches 00s.
+                    Next challenge starts automatically when the timer reaches 00s.
                   </p>
                 </div>
               </div>
@@ -361,29 +445,31 @@ export function QuizApp() {
           </article>
         </section>
 
-        {/* Leaderboard Section */}
+        {/* Live Friends Leaderboard */}
         <aside className="h-fit rounded-2xl border bg-card p-5 shadow-sm">
           <div className="flex items-center justify-between">
-            <h2 className="font-semibold text-foreground">Leaderboard</h2>
+            <h2 className="font-semibold text-foreground">Live Leaderboard</h2>
             <Trophy size={18} className="text-primary" />
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">Top players today</p>
+          <p className="mt-1 text-xs text-muted-foreground">Top scores</p>
           <div className="mt-5 space-y-1.5">
-            {data.leaderboard && data.leaderboard.length > 0 ? (
-              data.leaderboard.map((player, idx) => (
+            {leaderboard.length > 0 ? (
+              leaderboard.map((entry, idx) => (
                 <div
-                  key={player.username}
+                  key={entry.username}
                   className={`flex items-center justify-between rounded-lg px-3 py-2.5 text-sm transition ${
-                    player.username === data.player?.username
-                      ? 'bg-primary/10 border border-primary/20 font-medium'
-                      : 'hover:bg-muted/50'
+                    entry.username === player?.username
+                      ? "bg-primary/10 border border-primary/20 font-medium"
+                      : "hover:bg-muted/50"
                   }`}
                 >
                   <span className="flex items-center gap-2">
-                    <b className="font-mono text-xs text-muted-foreground w-5">{String(idx + 1).padStart(2, '0')}</b>
-                    <span className="truncate max-w-[140px]">{player.username}</span>
+                    <b className="font-mono text-xs text-muted-foreground w-5">
+                      {String(idx + 1).padStart(2, "0")}
+                    </b>
+                    <span className="truncate max-w-[140px]">{entry.username}</span>
                   </span>
-                  <b className="font-mono text-xs">{player.score} pts</b>
+                  <b className="font-mono text-xs">{entry.score} pts</b>
                 </div>
               ))
             ) : (

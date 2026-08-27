@@ -43,17 +43,23 @@ const MONGODB_URI = process.env.MONGODB_URI || ''
 
 declare global {
   // eslint-disable-next-line no-var
-  var __aptiquiz_mongo: { client: MongoClient; promise: Promise<MongoClient> } | undefined
+  var __aptiquiz_mongo: { client: MongoClient; promise: Promise<MongoClient>; lastFailed?: number } | undefined
 }
 
 async function getMongoClient(): Promise<MongoClient | null> {
   if (!MONGODB_URI) return null
 
-  if (!global.__aptiquiz_mongo) {
+  // If connection failed recently, avoid stalling every subsequent request
+  if (global.__aptiquiz_mongo?.lastFailed && Date.now() - global.__aptiquiz_mongo.lastFailed < 20000) {
+    return null
+  }
+
+  if (!global.__aptiquiz_mongo || global.__aptiquiz_mongo.lastFailed) {
     const client = new MongoClient(MONGODB_URI, {
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 10000,
+      maxPoolSize: 20,
+      serverSelectionTimeoutMS: 2000,
+      connectTimeoutMS: 2000,
+      socketTimeoutMS: 5000,
     })
     global.__aptiquiz_mongo = { client, promise: client.connect() }
   }
@@ -61,8 +67,13 @@ async function getMongoClient(): Promise<MongoClient | null> {
   try {
     await global.__aptiquiz_mongo.promise
     return global.__aptiquiz_mongo.client
-  } catch {
-    global.__aptiquiz_mongo = undefined
+  } catch (err) {
+    console.warn('[MongoDB] Connection failed, using in-memory store for 20s:', err instanceof Error ? err.message : err)
+    global.__aptiquiz_mongo = {
+      client: global.__aptiquiz_mongo.client,
+      promise: Promise.resolve(global.__aptiquiz_mongo.client),
+      lastFailed: Date.now()
+    }
     return null
   }
 }
