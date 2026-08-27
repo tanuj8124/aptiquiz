@@ -1,4 +1,4 @@
-﻿"use client"
+"use client"
 
 import { useEffect, useRef, useState, useCallback } from "react"
 import { Clock3, Trophy, Zap, LogOut, LockKeyhole, Loader2, CheckCircle2, XCircle } from "lucide-react"
@@ -237,12 +237,14 @@ export function QuizApp() {
   }
 
   // ---------------------------------------------------------------------------
-  // Sign Out
+  // Sign Out (Deletes user and session)
   // ---------------------------------------------------------------------------
   async function signOut() {
     try {
       esRef.current?.close()
       esRef.current = null
+      localStorage.removeItem("aptiquiz_name")
+      setName("")
       await fetch("/api/quiz", { method: "DELETE" })
       setStatus("unauthenticated")
       setPlayer(null)

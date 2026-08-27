@@ -1,9 +1,10 @@
-﻿import { NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
 import { cookies } from 'next/headers'
 import {
   getPlayer,
   getPlayerByNorm,
   upsertPlayer,
+  deletePlayer,
   getPlayerAnswer,
   submitAnswer,
 } from '@/lib/db'
@@ -34,12 +35,7 @@ export async function parsePlayer(cookieHeader?: string | null) {
     if (sig !== sign(payload)) return null
     const colonIdx = payload.indexOf(':')
     const id = colonIdx === -1 ? payload : payload.slice(0, colonIdx)
-    const b64username = colonIdx === -1 ? '' : payload.slice(colonIdx + 1)
-    let p = await getPlayer(id)
-    if (!p && b64username) {
-      const username = Buffer.from(b64username, 'base64url').toString('utf8')
-      p = await upsertPlayer(username, username.toLowerCase())
-    }
+    const p = await getPlayer(id)
     return p ? { id: p.id, username: p.username, score: p.score } : null
   } catch { return null }
 }
@@ -56,12 +52,7 @@ async function player() {
     if (sig !== sign(payload)) return null
     const colonIdx = payload.indexOf(':')
     const id = colonIdx === -1 ? payload : payload.slice(0, colonIdx)
-    const b64username = colonIdx === -1 ? '' : payload.slice(colonIdx + 1)
-    let p = await getPlayer(id)
-    if (!p && b64username) {
-      const username = Buffer.from(b64username, 'base64url').toString('utf8')
-      p = await upsertPlayer(username, username.toLowerCase())
-    }
+    const p = await getPlayer(id)
     return p ? { id: p.id, username: p.username, score: p.score } : null
   } catch { return null }
 }
@@ -134,6 +125,15 @@ export async function POST(req: Request) {
 }
 
 export async function DELETE() {
+  try {
+    const p = await player()
+    if (p) {
+      await deletePlayer(p.id)
+      broadcastLeaderboard().catch(console.error)
+    }
+  } catch (err) {
+    console.error('Error deleting player on sign out:', err)
+  }
   const res = NextResponse.json({ ok: true })
   res.cookies.delete(COOKIE)
   return res

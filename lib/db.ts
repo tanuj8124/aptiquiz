@@ -235,6 +235,41 @@ export async function upsertPlayer(clean: string, norm: string): Promise<PlayerR
 }
 
 // ---------------------------------------------------------------------------
+// deletePlayer
+// ---------------------------------------------------------------------------
+
+export async function deletePlayer(id: string): Promise<boolean> {
+  const client = await getMongoClient()
+  if (client) {
+    try {
+      const { players, answers } = db(client)
+      try {
+        await players.deleteOne({ _id: new ObjectId(id) })
+      } catch {}
+      await players.deleteOne({ _id: id as any })
+      await answers.deleteMany({ player_id: id })
+      return true
+    } catch (err) {
+      console.error('[MongoDB] deletePlayer error:', err)
+    }
+  }
+
+  // In-memory fallback
+  const player = mem.players.get(id)
+  if (player) {
+    mem.playersByNorm.delete(player.username_normalized)
+    mem.players.delete(id)
+    for (const [key, ans] of mem.answers.entries()) {
+      if (ans.player_id === id) {
+        mem.answers.delete(key)
+      }
+    }
+    return true
+  }
+  return false
+}
+
+// ---------------------------------------------------------------------------
 // getLeaderboard
 // ---------------------------------------------------------------------------
 
