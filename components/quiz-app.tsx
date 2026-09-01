@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState, useCallback } from "react"
-import { Clock3, Trophy, Zap, LogOut, LockKeyhole, Loader2, CheckCircle2, XCircle } from "lucide-react"
+import { Clock3, Trophy, Zap, LogOut, LockKeyhole, Loader2, CheckCircle2, XCircle, ChevronRight } from "lucide-react"
 import { deloitteFallbackBank } from "@/app/api/quiz/question-bank"
 
 // ---------------------------------------------------------------------------
@@ -71,6 +71,10 @@ export function QuizApp() {
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([])
   const [secondsLeft, setSecondsLeft] = useState<number>(getSecondsLeft)
 
+  // Per-user question navigation offset (independent of the global timer)
+  const [questionOffset, setQuestionOffset] = useState(0)
+  const questionOffsetRef = useRef(0)
+
   // Local answer selection & feedback
   const [selected, setSelected] = useState<number | null>(null)
   const [localResult, setLocalResult] = useState<{ selected_index: number; is_correct: boolean } | null>(null)
@@ -92,6 +96,9 @@ export function QuizApp() {
         // Instant 0ms transition right as the second hits 00
         roundKeyRef.current = currKey
         setRoundKey(currKey)
+        // Reset per-user offset when the global round changes
+        questionOffsetRef.current = 0
+        setQuestionOffset(0)
         setRound(getLocalRound(currKey))
         setSelected(null)
         setLocalResult(null)
@@ -227,13 +234,29 @@ export function QuizApp() {
     }
 
     // Submit to server in background for persistent DB score and friend leaderboard
-    fetch("/api/quiz", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ answer: idx }),
-    }).catch(() => {
-      // Background sync error - local progress is preserved
-    })
+    // Only submit for the base round (offset 0) so scores aren't double-counted
+    if (questionOffsetRef.current === 0) {
+      fetch("/api/quiz", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answer: idx }),
+      }).catch(() => {
+        // Background sync error - local progress is preserved
+      })
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Next Question — advance to the next question in the bank (per-user)
+  // ---------------------------------------------------------------------------
+  function goNextQuestion() {
+    const nextOffset = questionOffsetRef.current + 1
+    questionOffsetRef.current = nextOffset
+    setQuestionOffset(nextOffset)
+    setRound(getLocalRound(roundKey + nextOffset))
+    setSelected(null)
+    setLocalResult(null)
+    answerLockRef.current = false
   }
 
   // ---------------------------------------------------------------------------
@@ -320,9 +343,10 @@ export function QuizApp() {
     )
   }
 
+  // When offset > 0 the user is on a self-navigated question; timer lock doesn't apply
   const effectiveResult = localResult ?? round.result
   const answered = round.answered || !!localResult
-  const locked = secondsLeft === 0 || answered
+  const locked = (questionOffset === 0 && secondsLeft === 0) || answered
   const isCorrect = effectiveResult?.is_correct
 
   // ---------------------------------------------------------------------------
@@ -423,33 +447,47 @@ export function QuizApp() {
             </div>
 
             {locked && (
-              <div className="mt-6 flex items-start gap-3 rounded-xl bg-muted/60 border p-4 text-sm">
-                {effectiveResult ? (
-                  isCorrect ? (
-                    <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-500" />
+              <div className="mt-6 space-y-3">
+                <div className="flex items-start gap-3 rounded-xl bg-muted/60 border p-4 text-sm">
+                  {effectiveResult ? (
+                    isCorrect ? (
+                      <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-500" />
+                    ) : (
+                      <XCircle size={18} className="mt-0.5 shrink-0 text-rose-500" />
+                    )
                   ) : (
-                    <XCircle size={18} className="mt-0.5 shrink-0 text-rose-500" />
-                  )
-                ) : (
-                  <LockKeyhole size={18} className="mt-0.5 shrink-0 text-muted-foreground" />
-                )}
-                <div>
-                  <p className="font-semibold">
-                    {effectiveResult
-                      ? isCorrect
-                        ? "Correct! +1 point added."
-                        : "Not quite right this time."
-                      : "Round locked - time is up!"}
-                  </p>
-                  {effectiveResult && round.explanation && (
-                    <p className="mt-1 text-muted-foreground text-xs leading-relaxed">
-                      {round.explanation}
-                    </p>
+                    <LockKeyhole size={18} className="mt-0.5 shrink-0 text-muted-foreground" />
                   )}
-                  <p className="mt-2 text-xs font-mono text-primary">
-                    Next challenge starts automatically when the timer reaches 00s.
-                  </p>
+                  <div>
+                    <p className="font-semibold">
+                      {effectiveResult
+                        ? isCorrect
+                          ? "Correct! +1 point added."
+                          : "Not quite right this time."
+                        : "Round locked - time is up!"}
+                    </p>
+                    {effectiveResult && round.explanation && (
+                      <p className="mt-1 text-muted-foreground text-xs leading-relaxed">
+                        {round.explanation}
+                      </p>
+                    )}
+                    <p className="mt-2 text-xs font-mono text-primary">
+                      {questionOffset === 0
+                        ? "Next challenge starts automatically when the timer reaches 00s."
+                        : `Practice question ${questionOffset} · scores not counted`}
+                    </p>
+                  </div>
                 </div>
+
+                {/* Next Question Button */}
+                <button
+                  id="next-question-btn"
+                  onClick={goNextQuestion}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/8 px-5 py-3 text-sm font-semibold text-primary transition-all hover:bg-primary hover:text-primary-foreground hover:border-primary hover:shadow-md hover:shadow-primary/20 active:scale-[0.98]"
+                >
+                  Next Question
+                  <ChevronRight size={16} className="transition-transform group-hover:translate-x-0.5" />
+                </button>
               </div>
             )}
           </article>
